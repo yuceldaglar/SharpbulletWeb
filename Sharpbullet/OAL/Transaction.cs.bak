@@ -1,0 +1,553 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Collections;
+using SharpBullet.DAL;
+using System.Data;
+using System.Threading;
+using System.Diagnostics;
+
+namespace SharpBullet.OAL
+{
+    public delegate Transaction GetTransaction();
+
+    public class Transaction
+    {
+        public event ExecutedEventHandler Executed;
+        public event EventHandler Committed;
+        public delegate void ExecutedEventHandler(string sql);
+        public int ThreadId { get; set; }
+
+        private Dictionary<string, DataTable> cache;
+
+        public Dictionary<string, DataTable> Cache
+        {
+            get
+            {
+                if (cache == null) cache = new Dictionary<string, DataTable>();
+                return cache;
+            }
+            set { cache = value; }
+        }
+
+        /// <summary>
+        /// Web ve Application server gibi ortamlardaki session mantýðýný desteklemek için kullanýlýr.
+        /// Yani set edilen T.Provider, session bazýnda bir nesne verebilmelidir.
+        /// </summary>
+        public static GetTransaction TransactionProvider;
+
+        private static ISqlHelper sqlHelper;
+        private static string httpContextKey = "SharpBullet.Transaction";
+
+        public static Transaction Instance
+        {
+            get
+            {
+                Transaction instance = null;
+
+
+                //Asp.Net içinde SharpBullet kullanuýldýðýnda, her sayfa request'inin kendi transaction kuyruðu olmalý.
+                if (System.Web.HttpContext.Current != null)
+                {
+                    if (!System.Web.HttpContext.Current.Items.Contains(httpContextKey))
+                    {
+                        System.Web.HttpContext.Current.Items.Add(httpContextKey, new Transaction());
+                    }
+                    return (Transaction)System.Web.HttpContext.Current.Items[httpContextKey];
+                }
+                else
+                {
+                    int id = Thread.CurrentThread.ManagedThreadId;
+                    if (!threadStack.ContainsKey(id))
+                    {
+                        threadStack[id] = new Transaction();
+                        threadStack[id].ThreadId = id;
+                    }
+                    instance = threadStack[id];
+                }
+
+                return instance;
+            }
+
+            set
+            {
+                int id = Thread.CurrentThread.ManagedThreadId;
+                threadStack[id] = value;
+                threadStack[id].ThreadId = id;
+            }
+        }
+
+        private static Dictionary<int, Transaction> threadStack = new Dictionary<int, Transaction>();
+
+        private string _connectionString, _dbType;
+
+        private string dbType { get { return _dbType ?? Configuration.GetString("DbType") ?? "System.Data.SqlClient"; } }
+        private string connectionString { get { return _connectionString ?? Configuration.GetString("Connection"); } }
+
+        public Transaction()
+        {
+        }
+
+        public Transaction(string connectionString, string dbType)
+        {
+            this._dbType = dbType;
+            this._connectionString = connectionString;
+        }
+
+        private Stack<IConnectionHandle> stack = new Stack<IConnectionHandle>();
+
+        ///public delegate void D();
+
+        public void NewTransaction(Action run)
+        {
+            Join(run, null, null, true, -1);
+        }
+
+        public void NewTransaction(Action run, Action rollback, Action commit, bool startNewTransaction, int timeoutSeconds)
+        {
+            Join(run, rollback, commit, startNewTransaction, timeoutSeconds);
+        }
+
+        public void Join(Action run)
+        {
+            Join(run, null, null, false, -1);
+        }
+
+        public void JoinBeforeCommit(Action method)
+        {
+            Join(null, null, method, null, false, -1);
+        }
+
+        public void Join(Action run, Action rollback, Action commit, bool startNewTransaction, int timeoutSeconds)
+        {
+            Join(run, rollback, null, commit, startNewTransaction, timeoutSeconds);
+        }
+
+        public void Join(Action run, Action rollback, Action beforeCommit, Action commit, bool startNewTransaction, int timeoutSeconds)
+        {
+            object result = null;
+            bool owner;
+            IConnectionHandle connection = null;
+
+            if (stack.Count == 0 || startNewTransaction) //If there is no transaction start a new one.
+            {
+                connection = DataAccess.GetConnection(connectionString, dbType);
+                connection.TimeoutSeconds = timeoutSeconds < 0 ? 30 : 0;
+
+                DataAccess.Open(connection);
+                DataAccess.BeginTransaction(connection);
+                stack.Push(connection);
+                owner = true; //If this method call starts a new transaction, mark it as owner.
+            }
+            else
+            {
+                owner = false;
+                connection = stack.Peek();
+            }
+
+            try
+            {
+                if (rollback != null)
+                    connection.RollbackMethods.Add(rollback);
+
+                if (beforeCommit != null)
+                    connection.BeforeCommitMethods.Add(beforeCommit);
+
+                if (commit != null)
+                    connection.CommitMethods.Add(commit);
+
+                if (run != null)
+                    run();
+            }
+            catch (Exception ex)
+            {
+                if (owner)
+                {
+                    foreach (Action rollbackMethod in connection.RollbackMethods)
+                    {
+                        try
+                        {
+                            rollbackMethod();
+                        }
+                        catch { }
+                    }
+                    connection.RollbackMethods.Clear();
+
+                    connection = stack.Pop();
+                    DataAccess.Rollback(connection.TransactionHandle);
+                    DataAccess.Close(connection);
+                }
+                //TODO: Convert exception to a user friendly message. Conversion can take place in provider specific sql helper.
+                throw;
+            }
+
+            if (owner)
+            {
+                connection = stack.Peek();
+                foreach (var beforeCommitMethod in connection.BeforeCommitMethods)
+                {
+                    beforeCommitMethod();
+                }
+
+                connection = stack.Pop();
+                DataAccess.Commit(connection.TransactionHandle);
+                DataAccess.Close(connection);
+
+                connection.RollbackMethods.Clear();
+
+                foreach (Action commitMethod in connection.CommitMethods)
+                {
+                    try
+                    {
+                        commitMethod();
+                    }
+                    catch { }
+                }
+                connection.CommitMethods.Clear();
+
+                if (Committed != null)
+                    Committed(null, EventArgs.Empty);
+            }
+        }
+
+        public DataSet ExecuteSqlWithDataSet(string query, params object[] parameterValues)
+        {
+            return ExecuteSqlWithDataSet(query, null, parameterValues);
+        }
+
+        public DataSet ExecuteSqlWithDataSet(string query, Dictionary<string, object> namedParameters, params object[] parameterValues)
+        {
+            IConnectionHandle connection;
+            DataSet ds = null;
+
+            if (!this.dbType.Contains(".SqlClient"))
+                query = SqlHelper().Translate(query);
+
+            Join(delegate()
+            {
+                Stopwatch watch = null;
+                if (Executed != null)
+                {
+                    watch = new Stopwatch();
+                    watch.Start();
+                }
+
+                connection = stack.Peek();
+                try
+                {
+                    ds = DataAccess.ExecuteSqlWithDataSet(connection, query, namedParameters, parameterValues);
+                }
+                catch(Exception exception)
+                {
+                    OnExecuted(query+"\r\nERROR: "+exception.Message, namedParameters, parameterValues, watch);
+                    throw;
+                }
+
+                OnExecuted(query, namedParameters, parameterValues, watch);
+            });
+
+            return ds;
+        }
+
+
+        public DataTable ExecuteSql(string query, params object[] parameterValues)
+        {
+            return ExecuteSql(query, null, parameterValues);
+        }
+
+        public DataTable ExecuteSql(string query, Dictionary<string, object> namedParameters, params object[] parameterValues)
+        {
+            return ExecuteSql(query, namedParameters, 0, parameterValues);
+        }
+
+        public DataTable ExecuteSql(string query, Dictionary<string, object> namedParameters, int timeoutSeconds, params object[] parameterValues)
+        {
+            IConnectionHandle connection;
+            DataTable table = null;
+
+            if (!this.dbType.Contains(".SqlClient"))
+                query = SqlHelper().Translate(query);
+
+            Join(delegate()
+            {
+                Stopwatch watch = null;
+                if (Executed != null)
+                {
+                    watch = new Stopwatch();
+                    watch.Start();
+                }
+
+                connection = stack.Peek();
+                if (timeoutSeconds > 0)
+                {
+                    connection.TimeoutSeconds = timeoutSeconds;
+                }
+                try
+                {
+                    table = DataAccess.ExecuteSql(connection, query, namedParameters, parameterValues);
+                }
+                catch (Exception exception)
+                {
+                    OnExecuted(query + "\r\nERROR: " + exception.Message, namedParameters, parameterValues, watch);
+                    throw;
+                }
+
+                OnExecuted(query, namedParameters, parameterValues, watch);
+            });
+
+            return table;
+        }
+
+        private void OnExecuted(string query, Dictionary<string, object> namedParameters, object[] parameterValues, Stopwatch watch)
+        {
+            if (Executed == null) return;
+            if (watch != null)
+            {
+                watch.Stop();
+            }
+
+            string declare = "";
+
+            if (namedParameters != null)
+            {
+                foreach (string key in namedParameters.Keys)
+                {
+                    declare += "declare " + (key.StartsWith("@") ? key : "@" + key);
+
+                    if (namedParameters[key] is DateTime)
+                        declare += " datetime ='" + ((DateTime)namedParameters[key]).ToString("yyyyMMdd HH:mm:ss") + "'";
+                    else if (namedParameters[key] is int)
+                        declare += " int =" + namedParameters[key].ToString();
+                    else if (namedParameters[key] is decimal)
+                        declare += " decimal(38,9) =" + namedParameters[key].ToString();
+                    else
+                        declare += " varchar(" + namedParameters[key].ToString().Length + ")='" + namedParameters[key].ToString() + "'";
+
+                    declare = declare + Environment.NewLine;
+                }
+            }
+
+            if (parameterValues != null)
+            {
+                int i = 0;
+                foreach (object value in parameterValues)
+                {
+                    declare += "declare @prm" + i++;
+
+                    if (value == null) continue;
+
+                    if (value is DateTime)
+                        declare += " datetime ='" + ((DateTime)value).ToString("yyyyMMdd HH:mm:ss") + "'";
+                    else if (value is int)
+                        declare += " int =" + value.ToString();
+                    else if (value is decimal)
+                        declare += " decimal(38,9) =" + value.ToString();
+                    else
+                        declare += " varchar(" + value.ToString().Length + ")='" + value.ToString() + "'";
+
+                    declare = declare + Environment.NewLine;
+                }
+
+            }
+
+
+
+            long msecon = watch != null ? watch.ElapsedMilliseconds : -1;
+            Executed(Environment.NewLine + "/*-- Elapsed: " + msecon + "-------------------------------------------------*/" + Environment.NewLine + declare + Environment.NewLine + query);
+
+        }
+
+        public int ExecuteNonQuery(string query, params object[] parameterValues)
+        {
+            return ExecuteNonQuery(query, null, parameterValues, null);
+        }
+
+        public int ExecuteNonQuery(string query, Dictionary<string, object> namedParameters, object[] parameterValues)
+        {
+            return ExecuteNonQuery(query, namedParameters, parameterValues, null);
+        }
+
+        public int ExecuteNonQuery(string query, Dictionary<string, object> namedParameters, object[] parameterValues, params IParameterHandle[] extraParameters)
+        {
+            IConnectionHandle connection;
+            int i = 0;
+
+            if (!this.dbType.Contains(".SqlClient"))
+                query = SqlHelper().Translate(query);
+
+            Join(delegate()
+            {
+                Stopwatch watch = null;
+                if (Executed != null)
+                {
+                    watch = new Stopwatch();
+                    watch.Start();
+                }
+
+                connection = stack.Peek();
+                try
+                {
+                    i = DataAccess.ExecuteNonQuery(connection, query, namedParameters, parameterValues, extraParameters);
+                }
+                catch (Exception exception)
+                {
+                    OnExecuted(query + "\r\nERROR: " + exception.Message, namedParameters, parameterValues, watch);
+                    throw;
+                }
+
+                OnExecuted(query, namedParameters, parameterValues, watch);
+            });
+
+            return i;
+        }
+
+        public object ExecuteScalar(string query, params object[] parameterValues)
+        {
+            return ExecuteScalar(query, null, parameterValues);
+        }
+
+        public object ExecuteScalar(string query, Dictionary<string, object> namedParameters, params object[] parameterValues)
+        {
+            IConnectionHandle connection;
+            object result = null;
+
+            if (!this.dbType.Contains(".SqlClient"))
+                query = SqlHelper().Translate(query);
+
+            Join(delegate()
+            {
+                Stopwatch watch = null;
+                if (Executed != null)
+                {
+                    watch = new Stopwatch();
+                    watch.Start();
+                }
+
+                connection = stack.Peek();
+                try
+                {
+                    result = DataAccess.ExecuteScalar(connection, query, namedParameters, parameterValues);
+                }
+                catch (Exception exception)
+                {
+                    OnExecuted(query + "\r\nERROR: " + exception.Message, namedParameters, parameterValues, watch);
+                    throw;
+                }
+
+                OnExecuted(query, namedParameters, parameterValues, watch);
+            });
+
+            return result;
+        }
+
+        public DateTime ExecuteScalarDT(string query, params object[] parameterValues)
+        {
+            DateTime result;
+
+            result = Convert.ToDateTime(
+                ExecuteScalar(query, parameterValues));
+
+            return result;
+        }
+
+        public decimal ExecuteScalarD(string query, params object[] parameterValues)
+        {
+            decimal result = 0;
+
+            object value = ExecuteScalar(query, parameterValues);
+            if (value != DBNull.Value)
+                result = Convert.ToDecimal(value);
+
+            return result;
+        }
+
+        public int ExecuteScalarI(string query, params object[] parameterValues)
+        {
+            int result = 0;
+
+
+            object value = ExecuteScalar(query, parameterValues);
+            if (value != DBNull.Value)
+                result = Convert.ToInt32(value);
+
+            return result;
+        }
+
+        public long ExecuteScalarL(string query, params object[] parameterValues)
+        {
+            long result = 0;
+
+            object value = ExecuteScalar(query, parameterValues);
+            if (value != DBNull.Value)
+                result = Convert.ToInt64(value);
+
+            return result;
+        }
+
+        public string ExecuteScalarS(string query, params object[] parameterValues)
+        {
+            string result;
+
+            object value = ExecuteScalar(query, parameterValues) ?? "";
+            result = value.ToString();
+
+            return result;
+        }
+
+        public List<T> Execute<T>(string query, params object[] parameterValues)
+        {
+            PersistenceStrategy strategy;
+            Type type = typeof(T);
+            strategy = PersistenceStrategyProvider.FindStrategyFor(type);
+
+            DataTable dt = ExecuteSql(query, parameterValues);
+            List<T> list = new List<T>();
+            foreach (DataRow dr in dt.Rows)
+            {
+                T entity = Activator.CreateInstance<T>();
+                strategy.Fill(entity, dr);
+                list.Add(entity);
+            }
+            return list;
+        }
+
+        public IParameterHandle NewParameter(string name, object value, ParameterDirection direction)
+        {
+            IParameterHandle handle;
+            handle = DataAccess.NewParameter(dbType, name, value, direction);
+
+            return handle;
+        }
+
+        public string GetSchema()
+        {
+            return DataAccess.GetSchema(connectionString, dbType);
+        }
+
+        public ISqlHelper SqlHelper()
+        {
+            if (sqlHelper == null)
+            {
+                sqlHelper = SqlHelperProvider.FindHelperFor(dbType);
+            }
+
+            return sqlHelper;
+        }
+
+        public DataTable MetaTableColumns(string tablename)
+        {
+            DataTable result = null;
+            IConnectionHandle connection;
+
+            Join(delegate()
+            {
+                connection = stack.Peek();
+                result = DataAccess.MetaTableColumns(connection, tablename);
+            });
+            return result;
+        }
+
+    }
+
+
+}
